@@ -14,12 +14,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.time.Duration;
+import java.util.stream.Collectors;
 
 /**
  * Converter that transforms an OpenAPI specification into MCP tools, making API
@@ -34,6 +42,12 @@ public class OpenApiToMcpConverter implements AutoCloseable {
     private final StdioServerTransportProvider transportProvider;
     private final McpSyncServer mcpServer;
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final HttpClient httpClient;
+
+    // Configure logging to go to stderr
+    static {
+        System.setProperty("org.slf4j.simpleLogger.logFile", "System.err");
+    }
 
     /**
      * Creates a new OpenAPI to MCP converter.
@@ -47,7 +61,13 @@ public class OpenApiToMcpConverter implements AutoCloseable {
         this.openApiSpec = openApiSpec;
         this.baseUrl = baseUrl;
 
-        // Create MCP server transport provider (using stdio instead of HTTP)
+        // Create HTTP client for API calls
+        this.httpClient = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_2)
+                .connectTimeout(Duration.ofSeconds(30))
+                .build();
+
+        // Create MCP server transport provider (using stdio for stdin/stdout communication)
         this.transportProvider = new StdioServerTransportProvider();
 
         // Create MCP server and register tools based on OpenAPI spec
@@ -205,16 +225,14 @@ public class OpenApiToMcpConverter implements AutoCloseable {
         return new McpServerFeatures.SyncToolSpecification(
                 tool,
                 (exchange, args) -> {
-                    // Here we would implement the actual API call to the OpenAPI service
-                    // For the example, we'll just mock the responses
+                    // Make actual API call to the backend service
                     return handleApiRequest(operationId, path, method, args);
                 }
         );
     }
 
     /**
-     * Handles an API request by mocking responses appropriate for each operation.
-     * In a real implementation, this would make actual HTTP requests to the backend API.
+     * Handles an API request by making real HTTP calls to the backend API.
      */
     private McpSchema.CallToolResult handleApiRequest(
             String operationId,
@@ -225,47 +243,90 @@ public class OpenApiToMcpConverter implements AutoCloseable {
         logger.info("Executing operation: {} {} with args: {}", method, path, args);
 
         try {
-            // This is where you would implement the actual HTTP call to the backend API
-            // For demonstration purposes, we're just returning mock responses
+            // Replace path parameters in the URL
+            String resolvedPath = path;
+            for (Map.Entry<String, Object> entry : args.entrySet()) {
+                String paramName = entry.getKey();
+                Object paramValue = entry.getValue();
 
-            switch (operationId) {
-                case "listPets":
-                    int limit = args.containsKey("limit") ? ((Number)args.get("limit")).intValue() : 10;
-                    List<Map<String, Object>> pets = new ArrayList<>();
-                    for (int i = 1; i <= limit; i++) {
-                        Map<String, Object> pet = new HashMap<>();
-                        pet.put("id", i);
-                        pet.put("name", "Pet " + i);
-                        pet.put("tag", i % 2 == 0 ? "dog" : "cat");
-                        pets.add(pet);
-                    }
-                    return new McpSchema.CallToolResult(
-                            objectMapper.writeValueAsString(pets), false);
+                // Skip null values and the body parameter
+                if (paramValue == null || "body".equals(paramName)) {
+                    continue;
+                }
 
-                case "createPet":
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> petInput = (Map<String, Object>) args.get("body");
-                    Map<String, Object> createdPet = new HashMap<>(petInput);
-                    // Ensure the pet has an ID
-                    if (!createdPet.containsKey("id")) {
-                        createdPet.put("id", ThreadLocalRandom.current().nextInt(1000, 9999));
-                    }
-                    return new McpSchema.CallToolResult(
-                            objectMapper.writeValueAsString(createdPet), false);
-
-                case "getPet":
-                    String petId = args.get("petId").toString();
-                    Map<String, Object> pet = new HashMap<>();
-                    pet.put("id", Integer.parseInt(petId));
-                    pet.put("name", "Pet " + petId);
-                    pet.put("tag", Integer.parseInt(petId) % 2 == 0 ? "dog" : "cat");
-                    return new McpSchema.CallToolResult(
-                            objectMapper.writeValueAsString(pet), false);
-
-                default:
-                    return new McpSchema.CallToolResult(
-                            "Operation not implemented: " + operationId, true);
+                // Check if this parameter is used in the path
+                if (resolvedPath.contains("{" + paramName + "}")) {
+                    resolvedPath = resolvedPath.replace(
+                            "{" + paramName + "}",
+                            URLEncoder.encode(String.valueOf(paramValue), StandardCharsets.UTF_8));
+                }
             }
+
+            // Extract query parameters (those not used in path and not body)
+            Map<String, Object> queryParams = new HashMap<>();
+            for (Map.Entry<String, Object> entry : args.entrySet()) {
+                String paramName = entry.getKey();
+                Object paramValue = entry.getValue();
+
+                // Skip null values, path parameters, and body
+                if (paramValue == null || "body".equals(paramName) || resolvedPath.contains("{" + paramName + "}")) {
+                    continue;
+                }
+
+                // This must be a query parameter
+                queryParams.put(paramName, paramValue);
+            }
+
+            // Construct query string
+            String queryString = "";
+            if (!queryParams.isEmpty()) {
+                queryString = "?" + queryParams.entrySet().stream()
+                        .filter(e -> e.getValue() != null) // Additional null check
+                        .map(e -> URLEncoder.encode(e.getKey(), StandardCharsets.UTF_8) + "=" +
+                                URLEncoder.encode(String.valueOf(e.getValue()), StandardCharsets.UTF_8))
+                        .collect(Collectors.joining("&"));
+            }
+
+            // Construct final URL
+            String url = baseUrl + resolvedPath + queryString;
+
+            // Build HTTP request
+            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Accept", "application/json");
+
+            // Add request body for methods that need it
+            if (("POST".equals(method) || "PUT".equals(method) || "PATCH".equals(method)) && args.containsKey("body")) {
+                Object body = args.get("body");
+                if (body != null) {
+                    String requestBody = objectMapper.writeValueAsString(body);
+                    requestBuilder.header("Content-Type", "application/json")
+                            .method(method, HttpRequest.BodyPublishers.ofString(requestBody));
+                } else {
+                    requestBuilder.method(method, HttpRequest.BodyPublishers.noBody());
+                }
+            } else {
+                // For GET, DELETE, etc.
+                requestBuilder.method(method, HttpRequest.BodyPublishers.noBody());
+            }
+
+            HttpRequest request = requestBuilder.build();
+
+            // Execute the HTTP request
+            logger.info("Sending HTTP request: {} {}", method, url);
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            // Process the response
+            int statusCode = response.statusCode();
+            String responseBody = response.body();
+
+            logger.info("Received response: Status {} Body length: {}", statusCode, responseBody.length());
+
+            // Check if request was successful (2xx status code)
+            boolean isError = statusCode < 200 || statusCode >= 300;
+
+            return new McpSchema.CallToolResult(responseBody, isError);
+
         } catch (Exception e) {
             logger.error("Error handling API request", e);
             return new McpSchema.CallToolResult(

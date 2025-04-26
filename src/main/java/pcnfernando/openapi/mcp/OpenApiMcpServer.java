@@ -1,10 +1,12 @@
 package pcnfernando.openapi.mcp;
 
-import io.modelcontextprotocol.server.transport.StdioServerTransportProvider;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Standalone MCP server that reads a local OpenAPI specification file
@@ -12,11 +14,18 @@ import java.nio.file.Paths;
  * connected to by any MCP client like the MCP Inspector.
  */
 public class OpenApiMcpServer {
+    private static final Logger logger = LoggerFactory.getLogger(OpenApiMcpServer.class);
+
+    // Configure logging to go to stderr
+    static {
+        // This ensures SimpleLogger output goes to stderr
+        System.setProperty("org.slf4j.simpleLogger.logFile", "System.err");
+    }
 
     public static void main(String[] args) {
         if (args.length < 1) {
-            System.err.println("Usage: OpenApiMcpServer <openapi-spec-path> [base-url]");
-            System.err.println("Example: OpenApiMcpServer ./petstore.json https://api.example.com");
+            logger.error("Usage: OpenApiMcpServer <openapi-spec-path> [base-url]");
+            logger.error("Example: OpenApiMcpServer ./petstore.json https://api.example.com");
             System.exit(1);
         }
 
@@ -31,22 +40,19 @@ public class OpenApiMcpServer {
             Path path = Paths.get(openApiSpecPath);
             String openApiSpec = Files.readString(path);
 
-            System.err.println("Starting OpenAPI to MCP server with spec from: " + openApiSpecPath);
-            System.err.println("Using base URL: " + baseUrl);
+            logger.info("Starting OpenAPI to MCP server with spec from: {}", openApiSpecPath);
+            logger.info("Using base URL: {}", baseUrl);
 
             // Create the converter with stdio transport for communication with MCP clients
             OpenApiToMcpConverter converter = new OpenApiToMcpConverter(openApiSpec, baseUrl, 0);
 
-            // Note: We're using System.err for logging so it doesn't interfere with the
-            // stdio communication protocol which uses System.out/System.in
-
             // Set up a shutdown hook to clean up resources
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                System.err.println("Shutting down OpenAPI to MCP server...");
+                logger.info("Shutting down OpenAPI to MCP server...");
                 converter.shutdown();
             }));
 
-            System.err.println("OpenAPI to MCP server running...");
+            logger.info("OpenAPI to MCP server running...");
 
             // The server is now running on stdio transport
             // The main thread needs to stay alive, but we don't need to do anything else
@@ -54,12 +60,12 @@ public class OpenApiMcpServer {
             Thread.currentThread().join();
 
         } catch (IOException e) {
-            System.err.println("Error reading OpenAPI spec: " + e.getMessage());
-            e.printStackTrace();
+            logger.error("Error reading OpenAPI spec: {}", e.getMessage());
+            e.printStackTrace(System.err);
             System.exit(1);
         } catch (Exception e) {
-            System.err.println("Error starting OpenAPI to MCP server: " + e.getMessage());
-            e.printStackTrace();
+            logger.error("Error starting OpenAPI to MCP server: {}", e.getMessage());
+            e.printStackTrace(System.err);
             System.exit(1);
         }
     }
