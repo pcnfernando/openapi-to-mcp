@@ -49,6 +49,8 @@ java -jar target/openapi-mcp-0.1.0-SNAPSHOT-jar-with-dependencies.jar /path/to/o
 
 ## Connecting with MCP Inspector
 
+<img width="1789" alt="Screenshot 2025-04-27 at 01 09 58" src="https://github.com/user-attachments/assets/87152f2b-6e4b-4218-b2d4-4b58ba0512cd" />
+
 1. Launch MCP Inspector
 
 2. Select "Connect" or create a new connection
