@@ -1,4 +1,4 @@
-package io.modelcontextprotocol.openapi;
+package pcnfernando.openapi.mcp;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -40,21 +40,15 @@ public class OpenApiToMcpConverter implements AutoCloseable {
      *
      * @param openApiSpec The OpenAPI specification in JSON format
      * @param baseUrl     The base URL of the API
-     * @param port        The port to run the MCP server on
+     * @param port        The port to run the MCP server on (not used with stdio transport)
      * @throws IOException If there's an error parsing the OpenAPI spec
      */
     public OpenApiToMcpConverter(String openApiSpec, String baseUrl, int port) throws IOException {
         this.openApiSpec = openApiSpec;
         this.baseUrl = baseUrl;
 
-        // Create MCP server transport provider
-        this.transportProvider = HttpServletSseServerTransportProvider.builder()
-                .messageEndpoint("/mcp/message")
-                .sseEndpoint("/mcp/sse")
-                .build();
-
-        // Create and configure embedded Tomcat server
-        this.tomcat = createTomcatServer(port);
+        // Create MCP server transport provider (using stdio instead of HTTP)
+        this.transportProvider = new StdioServerTransportProvider();
 
         // Create MCP server and register tools based on OpenAPI spec
         this.mcpServer = createMcpServer();
@@ -62,8 +56,6 @@ public class OpenApiToMcpConverter implements AutoCloseable {
         // Start server
         start();
     }
-
-    // No longer need the Tomcat server setup method as we're using Stdio transport
 
     /**
      * Creates and configures the MCP server with tools based on the OpenAPI spec.
