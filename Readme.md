@@ -178,5 +178,162 @@ If you see Java errors:
 2. Check that your OpenAPI spec is valid JSON
 3. Look for error details in the server logs
 
+## Embedding in Other Applications
+
+### 1. Add the Dependency
+
+Add the OpenAPI to MCP converter to your project:
+
+```xml
+<!-- Maven -->
+<dependency>
+    <groupId>pcnfernando.mcp</groupId>
+    <artifactId>openapi-mcp</artifactId>
+    <version>0.1.0</version>
+</dependency>
+```
+
+```groovy
+// Gradle
+implementation 'pcnfernando.mcp:openapi-mcp:0.1.0'
+```
+
+### 2. Basic Usage
+
+Here's a simple example of embedding the MCP server in your application:
+
+```java
+import pcnfernando.openapi.mcp.OpenApiMcpServer;
+
+// Configure and start the server
+OpenApiMcpServer server = OpenApiMcpServer.builder()
+    .withOpenApiSpecFromFile("path/to/openapi.json")
+    .withBaseUrl("https://api.example.com")
+    .build();
+
+// Start the server
+server.start();
+
+// Register shutdown hook
+Runtime.getRuntime().addShutdownHook(new Thread(server::shutdown));
+```
+
+## Configuration Options
+
+The builder pattern provides several configuration options:
+
+### OpenAPI Specification
+
+You can provide the OpenAPI specification in three ways:
+
+```java
+// From a file
+.withOpenApiSpecFromFile("path/to/openapi.json")
+
+// From a URL
+.withOpenApiSpecFromUrl("https://example.com/api/openapi.json")
+
+// Directly as a string
+.withOpenApiSpec(openApiSpecString)
+```
+
+### API Base URL
+
+Set the base URL for the API:
+
+```java
+.withBaseUrl("https://api.example.com")
+```
+
+### MCP Capabilities
+
+Configure which MCP capabilities to enable and advertise:
+
+```java
+.withCapabilities(capabilities -> capabilities
+    .enableTools(true)        // Enable tools functionality
+    .enableResources(true)    // Enable resources functionality 
+    .enablePrompts(false)     // Disable prompts functionality
+    .advertiseTools(true)     // Advertise tools capability
+    .advertiseResources(true) // Advertise resources capability
+    .advertisePrompts(false)  // Don't advertise prompts capability
+)
+```
+
+### HTTP Headers
+
+Add custom headers to all API requests:
+
+```java
+// Add individual headers
+.withAdditionalHeader("X-API-Key", "your-api-key")
+.withAdditionalHeader("User-Agent", "MyApp/1.0")
+
+// Or add multiple headers at once
+.withAdditionalHeaders(Map.of(
+    "X-API-Key", "your-api-key",
+    "User-Agent", "MyApp/1.0"
+))
+```
+
+### Transport Configuration
+
+Configure the transport mechanism (currently only STDIO is fully supported):
+
+```java
+.withTransportType(OpenApiMcpServer.TransportType.STDIO)
+```
+
+## Framework Integration
+
+### Spring Boot
+
+For Spring Boot applications, create a configuration class:
+
+```java
+@Configuration
+public class OpenApiMcpConfig {
+
+    @Value("${api.base-url}")
+    private String apiBaseUrl;
+
+    @Value("${api.spec-location}")
+    private String apiSpecLocation;
+
+    @Bean(destroyMethod = "shutdown")
+    public OpenApiMcpServer openApiMcpServer() throws IOException {
+        OpenApiMcpServer server = OpenApiMcpServer.builder()
+                .withOpenApiSpecFromFile(apiSpecLocation)
+                .withBaseUrl(apiBaseUrl)
+                .build();
+                
+        server.start();
+        return server;
+    }
+}
+```
+
+## Environment Variables
+
+The converter supports several environment variables for configuration:
+
+- `SERVER_URL_OVERRIDE`: Override the base URL from the OpenAPI spec
+- `ENABLE_TOOLS`: Enable/disable tools functionality (default: true)
+- `ENABLE_RESOURCES`: Enable/disable resources functionality (default: false)
+- `ENABLE_PROMPTS`: Enable/disable prompts functionality (default: false)
+- `CAPABILITIES_TOOLS`: Advertise tools capability (default: true)
+- `CAPABILITIES_RESOURCES`: Advertise resources capability (default: false)
+- `CAPABILITIES_PROMPTS`: Advertise prompts capability (default: false)
+- `EXTRA_HEADERS`: Additional headers to include in API requests
+
+## Security Considerations
+
+When embedding the OpenAPI to MCP converter in production applications:
+
+1. Implement proper authentication for APIs
+2. Consider enabling TLS for API connections
+3. Carefully control which API endpoints are exposed as tools
+4. Sanitize descriptions to prevent prompt injection attacks
+
 ## License
 [MIT License](LICENSE)
