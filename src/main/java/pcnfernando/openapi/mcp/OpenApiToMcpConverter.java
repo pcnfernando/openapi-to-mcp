@@ -27,11 +27,12 @@ import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.time.Duration;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Converter that transforms an OpenAPI specification into MCP tools, making API
- * endpoints accessible through the Model Context Protocol.
+ * Enhanced converter that transforms an OpenAPI specification into MCP tools with rich semantic context,
+ * making API endpoints more accessible and understandable for AI models through the Model Context Protocol.
  */
 public class OpenApiToMcpConverter implements AutoCloseable {
 
@@ -43,6 +44,11 @@ public class OpenApiToMcpConverter implements AutoCloseable {
     private final McpSyncServer mcpServer;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final HttpClient httpClient;
+
+    // Pattern to detect potential security issues in descriptions
+    private static final Pattern SECURITY_PATTERN = Pattern.compile(
+            "(?i)(ignore|bypass|hack|sql\\s*inject|xss|exploit|malicious|\\bauth\\b|\\btoken\\b|credential)",
+            Pattern.CASE_INSENSITIVE);
 
     // Configure logging to go to stderr
     static {
@@ -85,16 +91,70 @@ public class OpenApiToMcpConverter implements AutoCloseable {
             // Parse OpenAPI spec
             JsonNode openApiJson = objectMapper.readTree(openApiSpec);
 
+            // Extract API info for global context
+            String apiTitle;
+            String apiDescription = "";
+            String apiVersion = "";
+
+            if (openApiJson.has("info")) {
+                JsonNode info = openApiJson.get("info");
+                if (info.has("title")) {
+                    apiTitle = info.get("title").asText();
+                } else {
+                    apiTitle = "API";
+                }
+                if (info.has("description")) {
+                    apiDescription = info.get("description").asText();
+                }
+                if (info.has("version")) {
+                    apiVersion = info.get("version").asText();
+                }
+            } else {
+                apiTitle = "API";
+            }
+
+            // Extract global external docs if available
+            String globalExternalDocs = "";
+            if (openApiJson.has("externalDocs")) {
+                JsonNode docs = openApiJson.get("externalDocs");
+                if (docs.has("description")) {
+                    globalExternalDocs = docs.get("description").asText();
+                }
+                if (docs.has("url")) {
+                    globalExternalDocs += " - " + docs.get("url").asText();
+                }
+            }
+
             // Build MCP server with tools derived from OpenAPI paths
             McpServer.SyncSpecification serverBuilder = McpServer.sync(transportProvider)
-                    .serverInfo("OpenAPI-MCP-Bridge", "1.0.0")
+                    .serverInfo(apiTitle, apiVersion)
                     .capabilities(McpSchema.ServerCapabilities.builder()
                             .tools(true)
                             .build());
 
+            // Extract tag descriptions for enriching tool context
+            Map<String, String> tagDescriptions = new HashMap<>();
+            if (openApiJson.has("tags") && openApiJson.get("tags").isArray()) {
+                for (JsonNode tag : openApiJson.get("tags")) {
+                    if (tag.has("name") && tag.has("description")) {
+                        tagDescriptions.put(tag.get("name").asText(), tag.get("description").asText());
+                    }
+                }
+            }
+
+            // Extract security schemes
+            Map<String, JsonNode> securitySchemes = new HashMap<>();
+            if (openApiJson.has("components") &&
+                    openApiJson.get("components").has("securitySchemes")) {
+                JsonNode schemes = openApiJson.get("components").get("securitySchemes");
+                schemes.fields().forEachRemaining(entry ->
+                        securitySchemes.put(entry.getKey(), entry.getValue()));
+            }
+
             // Process all paths in the OpenAPI spec
             JsonNode paths = openApiJson.get("paths");
             if (paths != null && paths.isObject()) {
+                String finalGlobalExternalDocs = globalExternalDocs;
                 paths.fields().forEachRemaining(pathEntry -> {
                     String path = pathEntry.getKey();
                     JsonNode operations = pathEntry.getValue();
@@ -105,12 +165,19 @@ public class OpenApiToMcpConverter implements AutoCloseable {
 
                         if (operation.has("operationId")) {
                             String operationId = operation.get("operationId").asText();
-                            String description = operation.has("summary") ?
-                                    operation.get("summary").asText() :
-                                    "Endpoint " + method + " " + path;
+
+                            // Create capability-oriented description
+                            String description = createCapabilityDescription(
+                                    operation, path, method, tagDescriptions, apiTitle, finalGlobalExternalDocs);
+
+                            // Sanitize description for security
+                            description = sanitizeDescription(description);
 
                             // Create input schema for the tool
                             ObjectNode inputSchema = createInputSchema(operation, path, method);
+
+                            // Add JSON-LD context if available
+                            enrichSchemaWithSemantics(inputSchema, operation, openApiJson);
 
                             // Create tool handler
                             McpServerFeatures.SyncToolSpecification toolSpec =
@@ -133,8 +200,179 @@ public class OpenApiToMcpConverter implements AutoCloseable {
     }
 
     /**
-     * Creates an input schema for an operation based on its parameters and request body.
-     * including header parameters.
+     * Creates a capability-oriented description for an API operation.
+     * This transforms traditional API documentation into capability descriptions
+     * that are more suitable for AI models to understand when and how to use the API.
+     */
+    private String createCapabilityDescription(
+            JsonNode operation,
+            String path,
+            String method,
+            Map<String, String> tagDescriptions,
+            String apiTitle,
+            String globalExternalDocs) {
+
+        StringBuilder description = new StringBuilder();
+
+        // Start with action-oriented summary
+        String actionVerb = getActionVerb(method);
+
+        if (operation.has("summary")) {
+            description.append(operation.get("summary").asText());
+        } else {
+            description.append(actionVerb).append(" ");
+
+            // Extract resource from path
+            String resource = extractResourceFromPath(path);
+            description.append(resource);
+        }
+
+        // Add detailed description
+        if (operation.has("description")) {
+            description.append("\n\n").append(operation.get("description").asText());
+        }
+
+        // Add semantic capability context based on HTTP method
+        description.append("\n\nCapability: ");
+        if (method.equalsIgnoreCase("GET")) {
+            description.append("Retrieves data without modifying resources. ");
+            description.append("Use this when you need to fetch information or check the current state.");
+        } else if (method.equalsIgnoreCase("POST")) {
+            description.append("Creates new resources or submits data. ");
+            description.append("Use this when you need to add new items or send information to the server.");
+        } else if (method.equalsIgnoreCase("PUT")) {
+            description.append("Updates or replaces existing resources. ");
+            description.append("Use this when you need to update the entire resource with a complete replacement.");
+        } else if (method.equalsIgnoreCase("PATCH")) {
+            description.append("Partially updates existing resources. ");
+            description.append("Use this when you need to make partial updates to a resource.");
+        } else if (method.equalsIgnoreCase("DELETE")) {
+            description.append("Removes resources. ");
+            description.append("Use this when you need to delete items or information.");
+        }
+
+        // Add domain context from tags
+        if (operation.has("tags") && operation.get("tags").isArray()) {
+            ArrayNode tags = (ArrayNode) operation.get("tags");
+            if (tags.size() > 0) {
+                description.append("\n\nDomain: ");
+                List<String> tagList = new ArrayList<>();
+
+                for (int i = 0; i < tags.size(); i++) {
+                    String tagName = tags.get(i).asText();
+                    tagList.add(tagName);
+
+                    // Add tag description if available
+                    if (tagDescriptions.containsKey(tagName)) {
+                        description.append("\n- ").append(tagName).append(": ")
+                                .append(tagDescriptions.get(tagName));
+                    }
+                }
+
+                // If no detailed tag descriptions were found, just list the tags
+                if (tagList.size() > 0 && !description.toString().contains("\n- ")) {
+                    description.append(String.join(", ", tagList));
+                }
+            }
+        }
+
+        // Add external documentation if available
+        if (operation.has("externalDocs")) {
+            JsonNode externalDocs = operation.get("externalDocs");
+            description.append("\n\nAdditional Information: ");
+            if (externalDocs.has("description")) {
+                description.append(externalDocs.get("description").asText());
+            }
+        }
+
+        // Add parameter usage examples if possible
+        if (operation.has("parameters") && operation.get("parameters").isArray()) {
+            description.append("\n\nUsage Example:");
+            // Just provide a basic example template
+            description.append("\n- To ").append(actionVerb.toLowerCase()).append(" ");
+            description.append(extractResourceFromPath(path));
+            description.append(", provide the required parameters.");
+        }
+
+        // Add request body example for POST/PUT/PATCH methods
+        if ((method.equals("POST") || method.equals("PUT") || method.equals("PATCH")) &&
+                operation.has("requestBody") &&
+                operation.get("requestBody").has("content") &&
+                operation.get("requestBody").get("content").has("application/json")) {
+
+            description.append("\n\nBody required for this operation. ");
+            description.append("Provide all required fields in the body parameter.");
+        }
+
+        // Add deprecation warning if applicable
+        if (operation.has("deprecated") && operation.get("deprecated").asBoolean()) {
+            description.append("\n\nWARNING: This operation is deprecated and may be removed in future versions.");
+        }
+
+        return description.toString();
+    }
+
+    /**
+     * Extract a user-friendly resource name from a path.
+     */
+    private String extractResourceFromPath(String path) {
+        // Remove leading and trailing slashes
+        String cleanPath = path.replaceAll("^/+|/+$", "");
+
+        // Replace path parameters with friendly names
+        cleanPath = cleanPath.replaceAll("\\{([^}]+)\\}", "specific $1");
+
+        // Replace slashes with spaces
+        cleanPath = cleanPath.replace("/", " ");
+
+        // If empty, return generic resource
+        if (cleanPath.isEmpty()) {
+            return "resource";
+        }
+
+        return cleanPath;
+    }
+
+    /**
+     * Get the appropriate action verb for an HTTP method.
+     */
+    private String getActionVerb(String method) {
+        switch (method.toUpperCase()) {
+            case "GET": return "Retrieve";
+            case "POST": return "Create";
+            case "PUT": return "Update";
+            case "PATCH": return "Modify";
+            case "DELETE": return "Delete";
+            default: return "Use";
+        }
+    }
+
+    /**
+     * Sanitizes a description to prevent potential security issues.
+     */
+    private String sanitizeDescription(String description) {
+        if (description == null) {
+            return "";
+        }
+
+        // Check for potential security issues
+        if (SECURITY_PATTERN.matcher(description).find()) {
+            logger.warn("Potentially unsafe content detected in description. Sanitizing.");
+            // Replace suspicious patterns with neutral terms
+            description = SECURITY_PATTERN.matcher(description)
+                    .replaceAll("[FILTERED]");
+        }
+
+        // Remove any instructions that might look like prompt injection
+        description = description.replaceAll("(?i)(ignore|forget|disregard) (previous|earlier|above) instructions",
+                "[FILTERED CONTENT]");
+
+        return description;
+    }
+
+    /**
+     * Creates an input schema for an operation based on its parameters and request body,
+     * including header parameters with enhanced descriptions.
      */
     private ObjectNode createInputSchema(JsonNode operation, String path, String method) {
         ObjectNode schema = objectMapper.createObjectNode();
@@ -152,7 +390,13 @@ public class OpenApiToMcpConverter implements AutoCloseable {
                         String name = param.get("name").asText();
                         JsonNode paramSchema = param.get("schema");
                         if (paramSchema != null) {
-                            properties.set(name, paramSchema);
+                            // Enhanced: Copy the schema and add a more descriptive parameter description
+                            ObjectNode enhancedSchema = paramSchema.deepCopy();
+                            if (param.has("description")) {
+                                String enhancedDesc = "Path parameter: " + param.get("description").asText();
+                                enhancedSchema.put("description", enhancedDesc);
+                            }
+                            properties.set(name, enhancedSchema);
                             if (param.has("required") && param.get("required").asBoolean()) {
                                 required.add(name);
                             }
@@ -170,7 +414,13 @@ public class OpenApiToMcpConverter implements AutoCloseable {
                     String name = param.get("name").asText();
                     JsonNode paramSchema = param.get("schema");
                     if (paramSchema != null) {
-                        properties.set(name, paramSchema);
+                        // Enhanced: Copy the schema and add a more descriptive parameter description
+                        ObjectNode enhancedSchema = paramSchema.deepCopy();
+                        if (param.has("description")) {
+                            String enhancedDesc = "Query parameter: " + param.get("description").asText();
+                            enhancedSchema.put("description", enhancedDesc);
+                        }
+                        properties.set(name, enhancedSchema);
                         if (param.has("required") && param.get("required").asBoolean()) {
                             required.add(name);
                         }
@@ -188,7 +438,13 @@ public class OpenApiToMcpConverter implements AutoCloseable {
                     String headerParamName = "header_" + name;
                     JsonNode paramSchema = param.get("schema");
                     if (paramSchema != null) {
-                        properties.set(headerParamName, paramSchema);
+                        // Enhanced: Copy the schema and add a more descriptive parameter description
+                        ObjectNode enhancedSchema = paramSchema.deepCopy();
+                        if (param.has("description")) {
+                            String enhancedDesc = "HTTP Header: " + param.get("description").asText();
+                            enhancedSchema.put("description", enhancedDesc);
+                        }
+                        properties.set(headerParamName, enhancedSchema);
                         if (param.has("required") && param.get("required").asBoolean()) {
                             required.add(headerParamName);
                         }
@@ -197,7 +453,7 @@ public class OpenApiToMcpConverter implements AutoCloseable {
             }
         }
 
-        // Process request body for POST, PUT, PATCH
+        // Process request body for POST, PUT, PATCH with enhanced descriptions
         if (("POST".equals(method) || "PUT".equals(method) || "PATCH".equals(method))
                 && operation.has("requestBody")) {
             JsonNode requestBody = operation.get("requestBody");
@@ -207,7 +463,16 @@ public class OpenApiToMcpConverter implements AutoCloseable {
                         .get("schema");
 
                 if (contentSchema != null) {
-                    properties.set("body", contentSchema);
+                    ObjectNode enhancedBodySchema = contentSchema.deepCopy();
+                    // Add a descriptive name for the body parameter
+                    if (requestBody.has("description")) {
+                        enhancedBodySchema.put("description",
+                                "Request Body: " + requestBody.get("description").asText());
+                    } else {
+                        enhancedBodySchema.put("description",
+                                "Request Body: Data to be sent in the request");
+                    }
+                    properties.set("body", enhancedBodySchema);
                     if (requestBody.has("required") && requestBody.get("required").asBoolean()) {
                         required.add("body");
                     }
@@ -215,16 +480,30 @@ public class OpenApiToMcpConverter implements AutoCloseable {
             }
         }
 
-        // Add security fields (for API keys, tokens, etc.)
+        // Add security fields with more detailed descriptions
         JsonNode security = operation.get("security");
         if (security != null && security.isArray() && security.size() > 0) {
             // For each security requirement
             for (JsonNode secReq : security) {
                 secReq.fieldNames().forEachRemaining(secName -> {
-                    // Add as a header parameter
+                    // Add as a header parameter with enhanced description
+                    String description = "Authentication: Required for this operation. ";
+
+                    // Add security scope information if available
+                    ArrayNode scopes = (ArrayNode) secReq.get(secName);
+                    if (scopes != null && scopes.size() > 0) {
+                        List<String> scopeList = new ArrayList<>();
+                        for (JsonNode scope : scopes) {
+                            scopeList.add(scope.asText());
+                        }
+                        if (!scopeList.isEmpty()) {
+                            description += "Required scopes: " + String.join(", ", scopeList);
+                        }
+                    }
+
                     properties.put("auth_" + secName, objectMapper.createObjectNode()
                             .put("type", "string")
-                            .put("description", "Authentication token or API key for " + secName));
+                            .put("description", description));
                 });
             }
         }
@@ -238,6 +517,40 @@ public class OpenApiToMcpConverter implements AutoCloseable {
     }
 
     /**
+     * Enriches a schema with semantic information from JSON-LD or extension properties.
+     */
+    private void enrichSchemaWithSemantics(ObjectNode schema, JsonNode operation, JsonNode openApiSpec) {
+        // Check for x-linkedData or similar extensions in the operation
+        if (operation.has("x-linkedData")) {
+            ObjectNode annotations = objectMapper.createObjectNode();
+            annotations.set("linkedData", operation.get("x-linkedData"));
+            schema.set("x-semantic-annotations", annotations);
+        }
+
+        // Check for x-properties at the operation level
+        operation.fields().forEachRemaining(entry -> {
+            String fieldName = entry.getKey();
+            if (fieldName.startsWith("x-") && !fieldName.equals("x-linkedData")) {
+                // Include custom extensions as annotations
+                if (!schema.has("x-semantic-annotations")) {
+                    schema.set("x-semantic-annotations", objectMapper.createObjectNode());
+                }
+                ((ObjectNode)schema.get("x-semantic-annotations")).set(
+                        fieldName.substring(2), entry.getValue());
+            }
+        });
+
+        // Check for global JSON-LD context in OpenAPI spec's info section
+        if (openApiSpec.has("info") && openApiSpec.get("info").has("x-linkedData")) {
+            if (!schema.has("x-semantic-annotations")) {
+                schema.set("x-semantic-annotations", objectMapper.createObjectNode());
+            }
+            ((ObjectNode)schema.get("x-semantic-annotations")).set(
+                    "apiContext", openApiSpec.get("info").get("x-linkedData"));
+        }
+    }
+
+    /**
      * Creates a tool specification for the given operation.
      */
     private McpServerFeatures.SyncToolSpecification createToolSpecification(
@@ -247,9 +560,12 @@ public class OpenApiToMcpConverter implements AutoCloseable {
             String path,
             String method) {
 
-        // Create the tool definition
+        // Ensure the operationId is properly action-oriented
+        String enhancedOperationId = ensureActionOriented(operationId, method, path);
+
+        // Create the tool definition with enhanced operationId
         McpSchema.Tool tool = new McpSchema.Tool(
-                operationId,
+                enhancedOperationId,
                 description,
                 inputSchema.toString()
         );
@@ -259,9 +575,55 @@ public class OpenApiToMcpConverter implements AutoCloseable {
                 tool,
                 (exchange, args) -> {
                     // Make actual API call to the backend service
-                    return handleApiRequest(operationId, path, method, args);
+                    return handleApiRequest(enhancedOperationId, path, method, args);
                 }
         );
+    }
+
+    /**
+     * Ensures that an operationId is action-oriented (starts with a verb).
+     */
+    private String ensureActionOriented(String operationId, String method, String path) {
+        // Common verbs that might already be present in operationIds
+        List<String> commonVerbs = List.of(
+                "get", "retrieve", "fetch", "list", "find", "search",
+                "create", "add", "post", "insert",
+                "update", "modify", "change", "edit", "patch",
+                "delete", "remove", "clear"
+        );
+
+        // Check if operationId already starts with a common verb
+        for (String verb : commonVerbs) {
+            if (operationId.toLowerCase().startsWith(verb)) {
+                return operationId; // Already action-oriented
+            }
+        }
+
+        // If not action-oriented, prefix with appropriate verb based on HTTP method
+        switch (method.toUpperCase()) {
+            case "GET":
+                return "get" + capitalize(operationId);
+            case "POST":
+                return "create" + capitalize(operationId);
+            case "PUT":
+                return "update" + capitalize(operationId);
+            case "PATCH":
+                return "modify" + capitalize(operationId);
+            case "DELETE":
+                return "delete" + capitalize(operationId);
+            default:
+                return operationId;
+        }
+    }
+
+    /**
+     * Capitalizes the first letter of a string.
+     */
+    private String capitalize(String str) {
+        if (str == null || str.isEmpty()) {
+            return str;
+        }
+        return str.substring(0, 1).toUpperCase() + str.substring(1);
     }
 
     /**
@@ -421,7 +783,10 @@ public class OpenApiToMcpConverter implements AutoCloseable {
                     logger.error("HTTP error: {} {}", statusCode, responseBody);
                 }
 
-                return new McpSchema.CallToolResult(responseBody, isError);
+                // Format response for better readability in MCP
+                String formattedResponse = formatResponseForMcp(responseBody, statusCode);
+
+                return new McpSchema.CallToolResult(formattedResponse, isError);
             } catch (java.net.ConnectException e) {
                 logger.error("Connection error to URL: {}", url, e);
                 return new McpSchema.CallToolResult(
@@ -443,7 +808,37 @@ public class OpenApiToMcpConverter implements AutoCloseable {
         }
     }
 
+    /**
+     * Formats API response for better readability in MCP.
+     * Attempts to pretty-print JSON responses and add context for error responses.
+     */
+    private String formatResponseForMcp(String responseBody, int statusCode) {
+        try {
+            // Try to parse as JSON for prettier formatting
+            JsonNode jsonNode = objectMapper.readTree(responseBody);
 
+            StringBuilder formatted = new StringBuilder();
+
+            // Add status code context
+            if (statusCode >= 200 && statusCode < 300) {
+                formatted.append("SUCCESS (").append(statusCode).append("): ");
+            } else {
+                formatted.append("ERROR (").append(statusCode).append("): ");
+            }
+
+            // Add pretty-printed JSON
+            formatted.append("\n").append(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(jsonNode));
+
+            return formatted.toString();
+        } catch (Exception e) {
+            // If not valid JSON or other error, return as-is with status context
+            if (statusCode >= 200 && statusCode < 300) {
+                return "SUCCESS (" + statusCode + "): " + responseBody;
+            } else {
+                return "ERROR (" + statusCode + "): " + responseBody;
+            }
+        }
+    }
 
     /**
      * Starts the converter by initializing the MCP server.
