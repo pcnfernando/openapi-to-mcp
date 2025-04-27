@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.time.Duration;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.Iterator;
 
 /**
  * Enhanced converter that transforms an OpenAPI specification into MCP tools with rich semantic context,
@@ -55,6 +56,15 @@ public class OpenApiToMcpConverter implements AutoCloseable {
         System.setProperty("org.slf4j.simpleLogger.logFile", "System.err");
     }
 
+    // Default capabilities
+    private boolean enableTools = true;
+    private boolean enableResources = false;
+    private boolean enablePrompts = false;
+    private boolean advertiseTools = true;
+    private boolean advertiseResources = false;
+    private boolean advertisePrompts = false;
+    private Map<String, String> additionalHeaders = new HashMap<>();
+
     /**
      * Creates a new OpenAPI to MCP converter.
      *
@@ -66,6 +76,9 @@ public class OpenApiToMcpConverter implements AutoCloseable {
     public OpenApiToMcpConverter(String openApiSpec, String baseUrl, int port) throws IOException {
         this.openApiSpec = openApiSpec;
         this.baseUrl = baseUrl;
+
+        // Load configuration from environment variables
+        loadConfigFromEnvironment();
 
         // Create HTTP client for API calls
         this.httpClient = HttpClient.newBuilder()
@@ -81,6 +94,50 @@ public class OpenApiToMcpConverter implements AutoCloseable {
 
         // Start server
         start();
+    }
+
+    /**
+     * Loads configuration from environment variables.
+     */
+    private void loadConfigFromEnvironment() {
+        // Feature enablement configuration
+        enableTools = getBooleanEnv("ENABLE_TOOLS", true);
+        enableResources = getBooleanEnv("ENABLE_RESOURCES", false);
+        enablePrompts = getBooleanEnv("ENABLE_PROMPTS", false);
+
+        // Capability advertisement configuration
+        advertiseTools = getBooleanEnv("CAPABILITIES_TOOLS", true);
+        advertiseResources = getBooleanEnv("CAPABILITIES_RESOURCES", false);
+        advertisePrompts = getBooleanEnv("CAPABILITIES_PROMPTS", false);
+
+        // Load additional headers
+        String extraHeaders = System.getenv("EXTRA_HEADERS");
+        if (extraHeaders != null && !extraHeaders.isEmpty()) {
+            for (String headerLine : extraHeaders.split("\\r?\\n")) {
+                if (headerLine != null && headerLine.contains(":")) {
+                    String[] parts = headerLine.split(":", 2);
+                    if (parts.length == 2) {
+                        String key = parts[0].trim();
+                        String value = parts[1].trim();
+                        if (!key.isEmpty() && !value.isEmpty()) {
+                            additionalHeaders.put(key, value);
+                            logger.debug("Added additional header: {}", key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Helper method to get boolean environment variables with default values.
+     */
+    private boolean getBooleanEnv(String name, boolean defaultValue) {
+        String value = System.getenv(name);
+        if (value == null || value.isEmpty()) {
+            return defaultValue;
+        }
+        return value.toLowerCase().matches("true|yes|1|on");
     }
 
     /**
@@ -126,11 +183,31 @@ public class OpenApiToMcpConverter implements AutoCloseable {
             }
 
             // Build MCP server with tools derived from OpenAPI paths
+            // Set up capabilities based on configuration
+            McpSchema.ServerCapabilities.Builder capabilitiesBuilder = McpSchema.ServerCapabilities.builder();
+
+            // Add tools capability if enabled and advertised
+            if (enableTools && advertiseTools) {
+                capabilitiesBuilder.tools(true);
+            }
+
+            // Add resources capability if enabled and advertised
+            if (enableResources && advertiseResources) {
+                // Note: The current MCP Java SDK may not support resources capability
+                // This would need to be implemented when SDK supports it
+                logger.info("Resources capability enabled but may not be supported by the MCP Java SDK");
+            }
+
+            // Add prompts capability if enabled and advertised
+            if (enablePrompts && advertisePrompts) {
+                // Note: The current MCP Java SDK may not support prompts capability
+                // This would need to be implemented when SDK supports it
+                logger.info("Prompts capability enabled but may not be supported by the MCP Java SDK");
+            }
+
             McpServer.SyncSpecification serverBuilder = McpServer.sync(transportProvider)
                     .serverInfo(apiTitle, apiVersion)
-                    .capabilities(McpSchema.ServerCapabilities.builder()
-                            .tools(true)
-                            .build());
+                    .capabilities(capabilitiesBuilder.build());
 
             // Extract tag descriptions for enriching tool context
             Map<String, String> tagDescriptions = new HashMap<>();
@@ -338,12 +415,18 @@ public class OpenApiToMcpConverter implements AutoCloseable {
      */
     private String getActionVerb(String method) {
         switch (method.toUpperCase()) {
-            case "GET": return "Retrieve";
-            case "POST": return "Create";
-            case "PUT": return "Update";
-            case "PATCH": return "Modify";
-            case "DELETE": return "Delete";
-            default: return "Use";
+            case "GET":
+                return "Retrieve";
+            case "POST":
+                return "Create";
+            case "PUT":
+                return "Update";
+            case "PATCH":
+                return "Modify";
+            case "DELETE":
+                return "Delete";
+            default:
+                return "Use";
         }
     }
 
@@ -535,7 +618,7 @@ public class OpenApiToMcpConverter implements AutoCloseable {
                 if (!schema.has("x-semantic-annotations")) {
                     schema.set("x-semantic-annotations", objectMapper.createObjectNode());
                 }
-                ((ObjectNode)schema.get("x-semantic-annotations")).set(
+                ((ObjectNode) schema.get("x-semantic-annotations")).set(
                         fieldName.substring(2), entry.getValue());
             }
         });
@@ -545,7 +628,7 @@ public class OpenApiToMcpConverter implements AutoCloseable {
             if (!schema.has("x-semantic-annotations")) {
                 schema.set("x-semantic-annotations", objectMapper.createObjectNode());
             }
-            ((ObjectNode)schema.get("x-semantic-annotations")).set(
+            ((ObjectNode) schema.get("x-semantic-annotations")).set(
                     "apiContext", openApiSpec.get("info").get("x-linkedData"));
         }
     }
@@ -628,7 +711,7 @@ public class OpenApiToMcpConverter implements AutoCloseable {
 
     /**
      * Handles an API request by making real HTTP calls to the backend API.
-     * Now with header parameter support.
+     * Now with header parameter support and additional configurable headers.
      */
     private McpSchema.CallToolResult handleApiRequest(
             String operationId,
@@ -717,6 +800,12 @@ public class OpenApiToMcpConverter implements AutoCloseable {
             // Add standard headers
             requestBuilder.header("User-Agent", "OpenAPI-MCP-Bridge/1.0");
 
+            // Add any additional headers from configuration
+            for (Map.Entry<String, String> header : additionalHeaders.entrySet()) {
+                requestBuilder.header(header.getKey(), header.getValue());
+                logger.debug("Added additional header: {}", header.getKey());
+            }
+
             // Process header parameters
             for (Map.Entry<String, Object> entry : args.entrySet()) {
                 String paramName = entry.getKey();
@@ -786,31 +875,69 @@ public class OpenApiToMcpConverter implements AutoCloseable {
                 // Format response for better readability in MCP
                 String formattedResponse = formatResponseForMcp(responseBody, statusCode);
 
-                return new McpSchema.CallToolResult(formattedResponse, isError);
+                // Create the appropriate MCP-native response format
+                // In MCP, responses can be structured as multiple content elements
+                List<McpSchema.Content> responseContents = new ArrayList<>();
+
+                // Add the primary response content
+                responseContents.add(new McpSchema.TextContent(formattedResponse));
+
+                // Add metadata about the response as additional context
+                Map<String, Object> metadataMap = new HashMap<>();
+                metadataMap.put("statusCode", statusCode);
+                metadataMap.put("operation", operationId);
+                metadataMap.put("method", method);
+                metadataMap.put("path", path);
+
+                // Add response headers as metadata if they exist
+                Map<String, List<String>> responseHeaders = response.headers().map();
+                if (!responseHeaders.isEmpty()) {
+                    // Convert multi-valued headers to single string values for simplicity
+                    Map<String, String> simplifiedHeaders = new HashMap<>();
+                    for (Map.Entry<String, List<String>> header : responseHeaders.entrySet()) {
+                        String headerName = header.getKey();
+                        List<String> values = header.getValue();
+                        if (values != null && !values.isEmpty()) {
+                            simplifiedHeaders.put(headerName, String.join(", ", values));
+                        }
+                    }
+                    metadataMap.put("headers", simplifiedHeaders);
+                }
+
+                // Create metadata content
+                String metadataJson = objectMapper.writeValueAsString(metadataMap);
+                responseContents.add(new McpSchema.TextContent(metadataJson));
+
+                // Return formatted response with metadata in MCP-native format
+                return new McpSchema.CallToolResult(responseContents, isError);
             } catch (java.net.ConnectException e) {
                 logger.error("Connection error to URL: {}", url, e);
-                return new McpSchema.CallToolResult(
+                List<McpSchema.Content> errorContent = new ArrayList<>();
+                errorContent.add(new McpSchema.TextContent(
                         "Connection error: Cannot connect to " + url +
-                                ". Please check if the URL is correct and the server is running. Error: " + e.getMessage(),
-                        true);
+                                ". Please check if the URL is correct and the server is running. Error: " + e.getMessage()));
+                return new McpSchema.CallToolResult(errorContent, true);
             } catch (java.net.UnknownHostException e) {
                 logger.error("Unknown host in URL: {}", url, e);
-                return new McpSchema.CallToolResult(
+                List<McpSchema.Content> errorContent = new ArrayList<>();
+                errorContent.add(new McpSchema.TextContent(
                         "Unknown host: Cannot resolve hostname in " + url +
-                                ". Please check if the URL is correct. Error: " + e.getMessage(),
-                        true);
+                                ". Please check if the URL is correct. Error: " + e.getMessage()));
+                return new McpSchema.CallToolResult(errorContent, true);
             }
 
         } catch (Exception e) {
             logger.error("Error handling API request", e);
-            return new McpSchema.CallToolResult(
-                    "Error: " + e.getMessage(), true);
+            List<McpSchema.Content> errorContent = new ArrayList<>();
+            errorContent.add(new McpSchema.TextContent("Error: " + e.getMessage()));
+            return new McpSchema.CallToolResult(errorContent, true);
         }
     }
 
     /**
      * Formats API response for better readability in MCP.
      * Attempts to pretty-print JSON responses and add context for error responses.
+     * Enhanced with semantic markers to help AI models understand the response.
      */
     private String formatResponseForMcp(String responseBody, int statusCode) {
         try {
@@ -819,15 +946,118 @@ public class OpenApiToMcpConverter implements AutoCloseable {
 
             StringBuilder formatted = new StringBuilder();
 
-            // Add status code context
+            // Add semantic status code context with HTTP standard meanings
             if (statusCode >= 200 && statusCode < 300) {
                 formatted.append("SUCCESS (").append(statusCode).append("): ");
+
+                // Add more specific context based on common status codes
+                switch (statusCode) {
+                    case 200:
+                        formatted.append("OK - Request succeeded");
+                        break;
+                    case 201:
+                        formatted.append("Created - Resource successfully created");
+                        break;
+                    case 202:
+                        formatted.append("Accepted - Request accepted for processing");
+                        break;
+                    case 204:
+                        formatted.append("No Content - Request succeeded but no content returned");
+                        break;
+                    default:
+                        formatted.append("Request succeeded");
+                        break;
+                }
             } else {
                 formatted.append("ERROR (").append(statusCode).append("): ");
+
+                // Add more specific context based on common error codes
+                if (statusCode >= 400 && statusCode < 500) {
+                    switch (statusCode) {
+                        case 400:
+                            formatted.append("Bad Request - The request was invalid");
+                            break;
+                        case 401:
+                            formatted.append("Unauthorized - Authentication is required");
+                            break;
+                        case 403:
+                            formatted.append("Forbidden - You don't have permission");
+                            break;
+                        case 404:
+                            formatted.append("Not Found - The requested resource was not found");
+                            break;
+                        case 409:
+                            formatted.append("Conflict - Request conflicts with current state");
+                            break;
+                        case 429:
+                            formatted.append("Too Many Requests - Rate limit exceeded");
+                            break;
+                        default:
+                            formatted.append("Client error");
+                            break;
+                    }
+                } else if (statusCode >= 500) {
+                    switch (statusCode) {
+                        case 500:
+                            formatted.append("Internal Server Error - Something went wrong on the server");
+                            break;
+                        case 502:
+                            formatted.append("Bad Gateway - Invalid response from upstream server");
+                            break;
+                        case 503:
+                            formatted.append("Service Unavailable - Server temporarily unavailable");
+                            break;
+                        default:
+                            formatted.append("Server error");
+                            break;
+                    }
+                }
+            }
+
+            // Try to identify the type of response based on content
+            if (jsonNode.isObject()) {
+                int fieldCount = 0;
+                boolean hasId = false;
+                boolean hasList = false;
+                boolean hasError = false;
+
+                for (Iterator<String> it = jsonNode.fieldNames(); it.hasNext(); ) {
+                    String fieldName = it.next();
+                    fieldCount++;
+
+                    if (fieldName.equalsIgnoreCase("id") || fieldName.endsWith("Id")) {
+                        hasId = true;
+                    } else if (fieldName.equalsIgnoreCase("items") ||
+                            fieldName.equalsIgnoreCase("results") ||
+                            fieldName.equalsIgnoreCase("data") ||
+                            (jsonNode.get(fieldName) != null && jsonNode.get(fieldName).isArray())) {
+                        hasList = true;
+                    } else if (fieldName.equalsIgnoreCase("error") ||
+                            fieldName.equalsIgnoreCase("errors") ||
+                            fieldName.equalsIgnoreCase("message")) {
+                        hasError = true;
+                    }
+                }
+
+                // Add semantic hints about the response structure
+                formatted.append("\n\n");
+                if (hasList) {
+                    formatted.append("RESPONSE TYPE: Collection of resources");
+                } else if (hasId) {
+                    formatted.append("RESPONSE TYPE: Single resource");
+                } else if (hasError) {
+                    formatted.append("RESPONSE TYPE: Error details");
+                } else if (fieldCount > 0) {
+                    formatted.append("RESPONSE TYPE: Object");
+                } else {
+                    formatted.append("RESPONSE TYPE: Empty object");
+                }
+            } else if (jsonNode.isArray()) {
+                formatted.append("\n\nRESPONSE TYPE: Array with ").append(jsonNode.size()).append(" elements");
             }
 
             // Add pretty-printed JSON
-            formatted.append("\n").append(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(jsonNode));
+            formatted.append("\n\n").append(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(jsonNode));
 
             return formatted.toString();
         } catch (Exception e) {
