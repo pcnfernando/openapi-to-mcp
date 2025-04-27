@@ -56,9 +56,10 @@ java -jar target/openapi-mcp-0.1.0-SNAPSHOT-jar-with-dependencies.jar /path/to/o
 
 ## Connecting with Claude Desktop
 1. Create or edit Claude's configuration file:
-
+```
 On macOS: ~/Library/Application Support/Claude/claude_desktop_config.json
 On Windows: %APPDATA%\Claude\claude_desktop_config.json\
+```
 
 2. Add your OpenAPI MCP server configuration:
    ```json
@@ -77,10 +78,14 @@ On Windows: %APPDATA%\Claude\claude_desktop_config.json\
    }
 3. Restart Claude Desktop for the changes to take effect.   
 4. Verify the tools are available by looking for the hammer icon in the bottom right corner of the input box. Clicking on it should show your API operations as available tools.
-   
+   <img width="907" alt="Screenshot 2025-04-27 at 12 08 10" src="https://github.com/user-attachments/assets/06e264e4-76e4-49e2-b555-cff9c55c898a" />
+
 5. Test it out by asking Claude to perform operations using your API:
 
    Example: "Get the details for pet with ID 123 from the petstore API."
+
+   <img width="973" alt="Screenshot 2025-04-27 at 12 11 32" src="https://github.com/user-attachments/assets/d160a4de-6df8-4fb6-a038-cfa8f206b72f" />
+
 
 Claude will detect when to use the API operations and will ask for your approval before making the actual calls to the backend API.
 
